@@ -1,0 +1,34 @@
+services:
+  # 1. PostgreSQL Database Service
+  postgres-db:
+    image: postgres:18.4-trixie
+    container_name: postgres-container
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: mysecretpassword
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - old-postgres-data:/var/lib/postgresql
+
+  # 2. Your Spring Boot Service
+  spring-app:
+    build: .
+    container_name: spring-container
+    ports:
+      - "8080:8080"
+    # Wait for the database to be ready before starting the app
+    depends_on:
+      - postgres-db
+    environment:
+      # CRITICAL: Use the service name "postgres-db" instead of "localhost"
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres-db:5432/postgres
+      - SPRING_DATASOURCE_USERNAME=postgres
+      - SPRING_DATASOURCE_PASSWORD=mysecretpassword
+
+volumes:
+  # Instruct Compose that this volume already exists on your Mac
+  old-postgres-data:
+    external: true
+    name: edbb51391a46e9ad9a38850c010e3c6670733adfedb41e09b7767e18703eb680
