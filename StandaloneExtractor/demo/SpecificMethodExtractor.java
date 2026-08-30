@@ -11,9 +11,12 @@ import spoon.reflect.declaration.CtType;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
+import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
+import java.util.stream.Stream;
 
 public class SpecificMethodExtractor {
 
@@ -35,22 +38,53 @@ public class SpecificMethodExtractor {
 
         // 1. Initialize Spoon AST Parser
         Launcher launcher = new Launcher();
-        launcher.addInputResource(projectPath);
         
-        // NoClasspath mode allows Spoon to analyze code without full compiled binaries
+        // --- DUPLICATE HANDLING: Scan and add only valid source directories ---
+        List<File> sourceRoots = findModuleSourceRoots(projectPath);
+        System.out.println("Registering source roots:");
+        for (File srcDir : sourceRoots) {
+            System.out.println("  - " + srcDir.getAbsolutePath());
+            launcher.addInputResource(srcDir.getAbsolutePath());
+        }
+
+        // --- DUPLICATE HANDLING: Environment Settings ---
+        launcher.getEnvironment().setIgnoreSyntaxErrors(true);
+        launcher.getEnvironment().setAutoImports(false);
         launcher.getEnvironment().setNoClasspath(true);
         launcher.getEnvironment().setComplianceLevel(17);
 
-        System.out.println("Parsing codebase at: " + projectPath);
+        System.out.println("\nParsing codebase at: " + projectPath);
         launcher.buildModel();
         CtModel model = launcher.getModel();
 
-        // 2. Locate Target Class
-        CtClass<?> targetClass = model.getElements(new TypeFilter<CtClass<?>>(CtClass.class))
+        // 2. Locate Target Class (Handles potential duplicates safely)
+        List<CtClass<?>> candidateClasses = model.getElements(new TypeFilter<CtClass<?>>(CtClass.class))
                 .stream()
                 .filter(c -> c.getSimpleName().equalsIgnoreCase(targetClassName))
+                .toList();
+
+        if (candidateClasses.isEmpty()) {
+            throw new RuntimeException("Class not found: " + targetClassName);
+        }
+
+        // --- DUPLICATE HANDLING: Target Resolution ---
+        // Prioritize candidate classes with valid file sources inside 'src/main/java'
+        CtClass<?> targetClass = candidateClasses.stream()
+                .filter(c -> c.getPosition() != null 
+                          && c.getPosition().getFile() != null 
+                          && c.getPosition().getFile().getAbsolutePath().contains("src/main/java"))
                 .findFirst()
-                .orElseThrow(() -> new RuntimeException("Class not found: " + targetClassName));
+                .orElse(candidateClasses.get(0));
+
+        if (candidateClasses.size() > 1) {
+            String path = (targetClass.getPosition() != null && targetClass.getPosition().getFile() != null)
+                    ? targetClass.getPosition().getFile().getPath()
+                    : "Unknown Path";
+
+            System.out.println("⚠️ Warning: Found " + candidateClasses.size() + " instances of '" + targetClassName 
+                    + "'. Selected: " + targetClass.getQualifiedName() 
+                    + " (" + path + ")");
+        }
 
         // 3. Locate Target Method (Handles overloaded methods gracefully)
         List<CtMethod<?>> matchingMethods = targetClass.getMethodsByName(targetMethodName);
@@ -88,6 +122,37 @@ public class SpecificMethodExtractor {
         String outputFile = targetClassName + "_" + targetMethodName + "_payload.txt";
         Files.writeString(Path.of(outputFile), payload.toString());
         System.out.println("Done! Precision context payload written to: " + outputFile);
+    }
+
+    /**
+     * Filters repository directories to scan ONLY src/main/java folders,
+     * ignoring build/target outputs, tests, and backup directories.
+     */
+    private static List<File> findModuleSourceRoots(String rootPath) {
+        List<File> sourceRoots = new ArrayList<>();
+        try (Stream<Path> paths = Files.walk(Paths.get(rootPath))) {
+            paths.filter(Files::isDirectory)
+                 .filter(p -> p.endsWith(Paths.get("src", "main", "java")))
+                 .filter(p -> {
+                     String lower = p.toString().toLowerCase();
+                     return !lower.contains("/target/") && 
+                            !lower.contains("/build/") && 
+                            !lower.contains("/bin/") && 
+                            !lower.contains("/out/") &&
+                            !lower.contains("_backup") &&
+                            !lower.contains("_old");
+                 })
+                 .forEach(p -> sourceRoots.add(p.toFile()));
+        } catch (Exception e) {
+            System.err.println("Warning: Failed to walk project paths. Falling back to root directory.");
+        }
+
+        // Fallback to project root if no src/main/java folders were found
+        if (sourceRoots.isEmpty()) {
+            sourceRoots.add(new File(rootPath));
+        }
+
+        return sourceRoots;
     }
 
     private static void traceMethod(
