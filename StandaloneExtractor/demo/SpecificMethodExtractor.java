@@ -2,14 +2,14 @@ package com.example.demo;
 
 import spoon.Launcher;
 import spoon.reflect.CtModel;
+import spoon.reflect.code.CtExpression;
 import spoon.reflect.code.CtFieldAccess;
 import spoon.reflect.code.CtInvocation;
 import spoon.reflect.declaration.CtClass;
 import spoon.reflect.declaration.CtExecutable;
-import spoon.reflect.declaration.CtInterface;
 import spoon.reflect.declaration.CtMethod;
+import spoon.reflect.declaration.CtParameter;
 import spoon.reflect.declaration.CtType;
-import spoon.reflect.declaration.CtTypeInformation;
 import spoon.reflect.reference.CtTypeReference;
 import spoon.reflect.visitor.filter.TypeFilter;
 
@@ -18,12 +18,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class SpecificMethodExtractor {
 
+    // Packages to exclude from code graph traversal
     private static final Set<String> EXCLUDED_PACKAGES = Set.of(
         "java.", "javax.", "jakarta.", "org.springframework.", "org.apache.", "com.sun.", "lombok."
+    );
+
+    // Classes to treat as BLACK BOXES (Do not trace inside, extract stored proc/contract only)
+    private static final Set<String> BLACK_BOX_CLASSES = Set.of(
+        "GenericDaoImpl"
     );
 
     public static void main(String[] args) throws Exception {
@@ -80,12 +87,13 @@ public class SpecificMethodExtractor {
 
         Set<CtExecutable<?>> visitedMethods = new HashSet<>();
         Set<CtExecutable<?>> capturedMethods = new LinkedHashSet<>();
+        Set<String> blackBoxCalls = new LinkedHashSet<>();
         Set<CtType<?>> capturedDataTypes = new LinkedHashSet<>();
 
-        // Start tracing from the target method
-        traceMethod(model, targetMethod, visitedMethods, capturedMethods, capturedDataTypes);
+        // Start tracing from entry endpoint
+        traceMethod(model, targetMethod, visitedMethods, capturedMethods, blackBoxCalls, capturedDataTypes);
 
-        // Build Payload
+        // Build Final Output Payload
         StringBuilder payload = new StringBuilder();
         payload.append("// ENTRY POINT: ").append(targetClass.getQualifiedName()).append("#").append(targetMethod.getSimpleName()).append("\n\n");
 
@@ -96,6 +104,14 @@ public class SpecificMethodExtractor {
             
             payload.append("// Method: ").append(className).append("#").append(method.getSimpleName()).append("\n");
             payload.append(method.toString()).append("\n\n-----------------------------------\n\n");
+        }
+
+        if (!blackBoxCalls.isEmpty()) {
+            payload.append("// --- BLACK-BOX DAO / STORED PROCEDURE CALLS ---\n");
+            payload.append("// (Internal GenericDaoImpl code skipped; contract summary extracted below)\n\n");
+            for (String callSummary : blackBoxCalls) {
+                payload.append(callSummary).append("\n-----------------------------------\n\n");
+            }
         }
 
         if (!capturedDataTypes.isEmpty()) {
@@ -118,13 +134,14 @@ public class SpecificMethodExtractor {
             CtExecutable<?> method,
             Set<CtExecutable<?>> visitedMethods,
             Set<CtExecutable<?>> capturedMethods,
+            Set<String> blackBoxCalls,
             Set<CtType<?>> capturedDataTypes) {
 
         if (method == null || !visitedMethods.add(method)) {
             return;
         }
 
-        // Capture only the specific method hit during execution
+        // Capture method body
         capturedMethods.add(method);
 
         // Capture Parameter and Return Data Types
@@ -137,7 +154,7 @@ public class SpecificMethodExtractor {
             }
         });
 
-        // Capture Accessed Fields
+        // Capture Fields
         List<CtFieldAccess<?>> fieldAccesses = method.getElements(new TypeFilter<>(CtFieldAccess.class));
         for (CtFieldAccess<?> fieldAccess : fieldAccesses) {
             if (fieldAccess.getVariable() != null && fieldAccess.getVariable().getType() != null) {
@@ -156,32 +173,70 @@ public class SpecificMethodExtractor {
                 continue;
             }
 
-            // Check if the target is an Interface or Abstract Class
+            // CHECK: Is target a Black-Box class (e.g. GenericDaoImpl)?
+            if (isBlackBoxClass(targetType)) {
+                String contract = extractProcedureContract(invocation, target);
+                blackBoxCalls.add(contract);
+                continue; // STOP TRAVERSAL: Do not step inside GenericDaoImpl
+            }
+
+            // Handle Interface / Abstract Class implementation mapping
             if (targetType.isInterface() || targetType.hasModifier(spoon.reflect.declaration.ModifierKind.ABSTRACT)) {
-                // Find concrete implementing classes in the AST model
                 List<CtClass<?>> implementations = findImplementations(model, targetType);
 
                 for (CtClass<?> implClass : implementations) {
-                    // Find the matching method in the implementing class
+                    // CHECK: Is implementation class a Black-Box?
+                    if (isBlackBoxClass(implClass)) {
+                        String contract = extractProcedureContract(invocation, target);
+                        blackBoxCalls.add(contract);
+                        continue; // STOP TRAVERSAL
+                    }
+
                     CtMethod<?> implMethod = implClass.getMethod(
                             target.getSimpleName(), 
-                            target.getParameters().stream().map(p -> p.getType()).toArray(CtTypeReference[]::new)
+                            target.getParameters().stream().map(CtParameter::getType).toArray(CtTypeReference[]::new)
                     );
 
                     if (implMethod != null) {
-                        traceMethod(model, implMethod, visitedMethods, capturedMethods, capturedDataTypes);
+                        traceMethod(model, implMethod, visitedMethods, capturedMethods, blackBoxCalls, capturedDataTypes);
                     }
                 }
             } else {
-                // Concrete method call
-                traceMethod(model, target, visitedMethods, capturedMethods, capturedDataTypes);
+                // Regular concrete call
+                traceMethod(model, target, visitedMethods, capturedMethods, blackBoxCalls, capturedDataTypes);
             }
         }
     }
 
     /**
-     * Finds concrete classes that implement an interface or extend an abstract class.
+     * Inspects arguments passed into GenericDaoImpl invocations to format a clean procedure call summary for LLM context.
      */
+    private static String extractProcedureContract(CtInvocation<?> invocation, CtExecutable<?> target) {
+        StringBuilder sb = new StringBuilder();
+        CtType<?> declaringType = target.getParent(CtType.class);
+        String className = (declaringType != null) ? declaringType.getSimpleName() : "GenericDao";
+
+        sb.append("// BLACK-BOX CALL: ").append(className).append("#").append(target.getSimpleName()).append("\n");
+
+        List<CtExpression<?>> args = invocation.getArguments();
+        if (!args.isEmpty()) {
+            sb.append("// Passed Arguments / Procedure Contract:\n");
+            for (int i = 0; i < args.size(); i++) {
+                sb.append("//   Arg [").append(i + 1).append("]: ").append(args.get(i).toString()).append("\n");
+            }
+        } else {
+            sb.append("//   No parameters passed.\n");
+        }
+
+        return sb.toString();
+    }
+
+    private static boolean isBlackBoxClass(CtType<?> type) {
+        if (type == null) return false;
+        String simpleName = type.getSimpleName();
+        return BLACK_BOX_CLASSES.contains(simpleName);
+    }
+
     private static List<CtClass<?>> findImplementations(CtModel model, CtType<?> interfaceOrAbstractClass) {
         CtTypeReference<?> targetRef = interfaceOrAbstractClass.getReference();
 
@@ -189,11 +244,9 @@ public class SpecificMethodExtractor {
                 .stream()
                 .filter(c -> !c.isAbstract() && !c.isInterface())
                 .filter(c -> {
-                    // Check direct interface implementation
                     boolean implementsInterface = c.getSuperInterfaces().stream()
                             .anyMatch(i -> i.getQualifiedName().equals(targetRef.getQualifiedName()));
                     
-                    // Check superclass extension
                     boolean extendsSuperclass = c.getSuperclass() != null 
                             && c.getSuperclass().getQualifiedName().equals(targetRef.getQualifiedName());
 
