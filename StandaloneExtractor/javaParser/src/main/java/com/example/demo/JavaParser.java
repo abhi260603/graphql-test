@@ -252,28 +252,18 @@ public class JavaParser {
     }
 
     private static void captureDataTypes(Set<ClassOrInterfaceDeclaration> capturedDataTypes, MethodDeclaration method) {
+        // 1. Return type (unwraps List<T>, Optional<T>, etc.)
         addTypeIfEntityOrDto(method.getType(), capturedDataTypes);
+
+        // 2. Parameters
         for (Parameter param : method.getParameters()) {
             addTypeIfEntityOrDto(param.getType(), capturedDataTypes);
         }
-    }
 
-    private static void addTypeIfEntityOrDto(Type type, Set<ClassOrInterfaceDeclaration> capturedDataTypes) {
-        if (type == null) return;
-        try {
-            ResolvedType resolvedType = type.resolve();
-            if (resolvedType.isReferenceType()) {
-                String qualifiedName = resolvedType.asReferenceType().getQualifiedName();
-                if (isApplicationClass(qualifiedName)) {
-                    findClassDeclarationByQualifiedName(qualifiedName).ifPresent(decl -> {
-                        if (isDataModelType(decl)) {
-                            capturedDataTypes.add(decl);
-                        }
-                    });
-                }
-            }
-        } catch (Exception ignored) {
-        }
+        // 3. (Optional) Inspect local variable declarations inside the method body
+        method.findAll(VariableDeclarator.class).forEach(var -> {
+            addTypeIfEntityOrDto(var.getType(), capturedDataTypes);
+        });
     }
 
     private static boolean isDataModelType(ClassOrInterfaceDeclaration decl) {
@@ -521,6 +511,40 @@ public class JavaParser {
                     payload.append(cleanedType.toString()).append("\n\n-----------------------------------\n\n");
                 }
             }
+        }
+    }
+
+    private static void addTypeIfEntityOrDto(Type type, Set<ClassOrInterfaceDeclaration> capturedDataTypes) {
+        if (type == null) return;
+        try {
+            ResolvedType resolvedType = type.resolve();
+            extractAndRegisterType(resolvedType, capturedDataTypes);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private static void extractAndRegisterType(ResolvedType resolvedType, Set<ClassOrInterfaceDeclaration> capturedDataTypes) {
+        if (!resolvedType.isReferenceType()) return;
+
+        String qualifiedName = resolvedType.asReferenceType().getQualifiedName();
+
+        // 1. Direct check: Is this type itself an application entity/DTO?
+        if (isApplicationClass(qualifiedName)) {
+            findClassDeclarationByQualifiedName(qualifiedName).ifPresent(decl -> {
+                if (isDataModelType(decl)) {
+                    capturedDataTypes.add(decl);
+                }
+            });
+        }
+
+        // 2. Unpack Generics: e.g. List<AnInternalObject>, Optional<MyDto>, Map<String, MyEntity>
+        try {
+            var typeParametersMap = resolvedType.asReferenceType().getTypeParametersMap();
+            for (var pair : typeParametersMap) {
+                ResolvedType genericTypeParam = pair.b;
+                extractAndRegisterType(genericTypeParam, capturedDataTypes); // Recursively check generic arguments
+            }
+        } catch (Exception ignored) {
         }
     }
 }
