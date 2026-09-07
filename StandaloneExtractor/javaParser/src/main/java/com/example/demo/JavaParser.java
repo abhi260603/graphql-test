@@ -28,6 +28,8 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.stream.Stream;
 
+import static com.example.demo.OutputWriterUtil.*;
+
 public class JavaParser {
 
     private static class ExtractionContext {
@@ -47,41 +49,31 @@ public class JavaParser {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 3) {
-            System.out.println("Usage: java -jar java-ast-extractor-1.0.0.jar <repo-path> <ClassName> <MethodName>");
+            System.out.print("Usage: java -jar java-ast-extractor-1.0.0.jar <repo-path> <ClassName> <MethodName>");
             System.exit(1);
         }
         String projectPath = args[0];
         String targetClassName = args[1];
         String targetMethodName = args[2];
 
-        // 1. Setup Symbol Solver
         setupSymbolSolver(projectPath);
-
-        // 2. Resolve Target Entry Point
         ClassOrInterfaceDeclaration targetClass = getTargetClass(targetClassName);
         MethodDeclaration targetMethod = getTargetMethod(targetClass, targetMethodName, targetClassName);
-
-        // 3. Trace Context
         ExtractionContext extractionContext = new ExtractionContext();
         traceMethod(targetMethod, extractionContext);
-
-        // 4. Export Clean Payload
         StringBuilder payload = buildPayload(targetClass, targetMethod, extractionContext);
-        System.out.println(payload);
+        System.out.print(payload);
     }
 
     private static void setupSymbolSolver(String projectPath) throws IOException {
         CombinedTypeSolver typeSolver = new CombinedTypeSolver();
         typeSolver.add(new ReflectionTypeSolver());
-
         List<File> sourceRoots = findModuleSourceRoots(projectPath);
         for (File srcDir : sourceRoots) {
             typeSolver.add(new JavaParserTypeSolver(srcDir));
         }
-
         JavaSymbolSolver symbolSolver = new JavaSymbolSolver(typeSolver);
-        StaticJavaParser.getConfiguration().setSymbolResolver(symbolSolver);
-
+        StaticJavaParser.getParserConfiguration().setSymbolResolver(symbolSolver);
         for (File srcDir : sourceRoots) {
             try (Stream<Path> paths = Files.walk(srcDir.toPath())) {
                 paths.filter(p -> p.toString().endsWith(".java")).forEach(path -> {
@@ -102,7 +94,6 @@ public class JavaParser {
                     .filter(c -> c.getNameAsString().equalsIgnoreCase(targetClassName))
                     .forEach(candidateClasses::add);
         }
-
         if (candidateClasses.isEmpty()) {
             throw new RuntimeException("Class not found: " + targetClassName);
         }
@@ -119,11 +110,9 @@ public class JavaParser {
         if (method == null || !extractionContext.visitedMethods.add(method)) {
             return;
         }
-
         extractionContext.capturedMethods.add(method);
         captureDataTypes(extractionContext.capturedDataTypes, method);
         captureConstantsFromMethod(method, extractionContext);
-
         for (MethodCallExpr invocation : method.findAll(MethodCallExpr.class)) {
             try {
                 ResolvedMethodDeclaration target = invocation.resolve();
@@ -133,11 +122,11 @@ public class JavaParser {
         }
     }
 
-    private static void processInvocations(ResolvedMethodDeclaration target, MethodCallExpr invocation, ExtractionContext extractionContext) {
+    private record TargetContext(String declaringClassName, Optional<ClassOrInterfaceDeclaration> astDecl) {}
+
+    private static TargetContext resolveTargetContext(ResolvedMethodDeclaration target, MethodCallExpr invocation) {
         String declaringClassName = target.declaringType().getQualifiedName();
         Optional<ClassOrInterfaceDeclaration> astDecl = findClassDeclarationByQualifiedName(declaringClassName);
-
-        // Fallback scope resolution (e.g. movieRepository field typed as MovieRepository calling findById)
         if (invocation.getScope().isPresent()) {
             try {
                 ResolvedType scopeType = invocation.getScope().get().calculateResolvedType();
@@ -146,72 +135,82 @@ public class JavaParser {
                     if (isApplicationClass(scopeClassName)) {
                         Optional<ClassOrInterfaceDeclaration> scopeAstDecl = findClassDeclarationByQualifiedName(scopeClassName);
                         if (scopeAstDecl.isPresent()) {
-                            astDecl = scopeAstDecl;
-                            declaringClassName = scopeClassName;
+                            return new TargetContext(scopeClassName, scopeAstDecl);
                         }
                     }
                 }
             } catch (Exception ignored) {
             }
         }
+        return new TargetContext(declaringClassName, astDecl);
+    }
 
-        if (!isApplicationClass(declaringClassName)) {
+    private static boolean isBlackBox(ResolvedMethodDeclaration target, Optional<ClassOrInterfaceDeclaration> astDecl) {
+        return isBlackBoxClass(target.declaringType().getName())
+                || astDecl.map(d -> isBlackBoxClass(d.getNameAsString())).orElse(false);
+    }
+
+    private static void processAbstractOrInterfaceInvocation(ResolvedMethodDeclaration target, MethodCallExpr invocation,
+            TargetContext context, ExtractionContext extractionContext) {
+        context.astDecl().ifPresent(extractionContext.capturedInterfaces::add);
+        extractionContext.interfaceInvokedMethods
+                .computeIfAbsent(context.declaringClassName(), k -> new LinkedHashSet<>())
+                .add(target.getQualifiedSignature());
+        if (isBlackBox(target, context.astDecl())) {
+            extractionContext.blackBoxCalls.add(extractProcedureContract(invocation, target));
             return;
         }
+        findImplementations(context.declaringClassName())
+                .forEach(implClass -> processImplementationClass(target, invocation, implClass, extractionContext));
+    }
 
-        boolean isAbstractOrInterface = target.declaringType().isInterface() ||
+    private static Optional<MethodDeclaration> findMatchingAstMethod(ResolvedMethodDeclaration target, ClassOrInterfaceDeclaration clazz) {
+        if (clazz == null) return Optional.empty();
+        return clazz.getMethodsByName(target.getName()).stream()
+                .filter(m -> m.getParameters().size() == target.getNumberOfParams())
+                .findFirst();
+    }
+
+    private static void processImplementationClass(ResolvedMethodDeclaration target, MethodCallExpr invocation,
+                                                   ClassOrInterfaceDeclaration implClass, ExtractionContext extractionContext) {
+        if (isBlackBoxClass(implClass.getNameAsString())) {
+            extractionContext.blackBoxCalls.add(extractProcedureContract(invocation, target));
+            return;
+        }
+        findMatchingAstMethod(target, implClass)
+                .ifPresent(implMethod -> traceMethod(implMethod, extractionContext));
+    }
+
+    private static void processConcreteInvocation(ResolvedMethodDeclaration target, MethodCallExpr invocation,
+                                                  Optional<ClassOrInterfaceDeclaration> astDecl, ExtractionContext extractionContext) {
+        if (isBlackBox(target, astDecl)) {
+            extractionContext.blackBoxCalls.add(extractProcedureContract(invocation, target));
+            return;
+        }
+        findMatchingAstMethod(target, astDecl)
+                .ifPresent(targetMethod -> traceMethod(targetMethod, extractionContext));
+    }
+
+    private static void processInvocations(ResolvedMethodDeclaration target, MethodCallExpr invocation, ExtractionContext extractionContext) {
+        TargetContext targetContext = resolveTargetContext(target, invocation);
+        if (!isApplicationClass(targetContext.declaringClassName())) {
+            return;
+        }
+        if (isAbstractOrInterface(target, targetContext.astDecl())) {
+            processAbstractOrInterfaceInvocation(target, invocation, targetContext, extractionContext);
+        } else {
+            processConcreteInvocation(target, invocation, targetContext.astDecl(), extractionContext);
+        }
+    }
+
+    private static Optional<MethodDeclaration> findMatchingAstMethod(ResolvedMethodDeclaration target, Optional<ClassOrInterfaceDeclaration> astDecl) {
+        return astDecl.flatMap(clazz -> findMatchingAstMethod(target, clazz));
+    }
+
+    private static boolean isAbstractOrInterface(ResolvedMethodDeclaration target, Optional<ClassOrInterfaceDeclaration> astDecl) {
+        return target.declaringType().isInterface() ||
                 astDecl.map(ClassOrInterfaceDeclaration::isInterface).orElse(false) ||
                 astDecl.map(ClassOrInterfaceDeclaration::isAbstract).orElse(false);
-
-        if (isAbstractOrInterface) {
-            final String finalDeclaringClassName = declaringClassName;
-
-            // 1. Capture Application Interface Shell
-            astDecl.ifPresent(extractionContext.capturedInterfaces::add);
-
-            // 2. Track specific invocation signature under the interface (captures inherited methods like findById)
-            String methodSig = target.getQualifiedSignature();
-            extractionContext.interfaceInvokedMethods
-                    .computeIfAbsent(finalDeclaringClassName, k -> new LinkedHashSet<>())
-                    .add(methodSig);
-
-            // 3. Handle explicit Black-Box DAO classes
-            if (isBlackBoxClass(target.declaringType().getName()) ||
-                    astDecl.map(d -> isBlackBoxClass(d.getNameAsString())).orElse(false)) {
-                extractionContext.blackBoxCalls.add(extractProcedureContract(invocation, target));
-                return;
-            }
-
-            List<ClassOrInterfaceDeclaration> implementations = findImplementations(declaringClassName);
-
-            if (implementations.isEmpty()) {
-                // Application repository interface without custom .java implementation:
-                // ALREADY captured in capturedInterfaces and interfaceInvokedMethods above.
-                // Do NOT dump into blackBoxCalls.
-            } else {
-                for (ClassOrInterfaceDeclaration implClass : implementations) {
-                    if (isBlackBoxClass(implClass.getNameAsString())) {
-                        extractionContext.blackBoxCalls.add(extractProcedureContract(invocation, target));
-                        continue;
-                    }
-
-                    implClass.getMethodsByName(target.getName()).stream()
-                            .filter(m -> m.getParameters().size() == target.getNumberOfParams())
-                            .findFirst()
-                            .ifPresent(implMethod -> traceMethod(implMethod, extractionContext));
-                }
-            }
-        } else {
-            if (isBlackBoxClass(target.declaringType().getName())) {
-                extractionContext.blackBoxCalls.add(extractProcedureContract(invocation, target));
-                return;
-            }
-
-            astDecl.flatMap(clazz -> clazz.getMethodsByName(target.getName()).stream()
-                            .filter(m -> m.getParameters().size() == target.getNumberOfParams())
-                            .findFirst())
-                    .ifPresent(targetMethod -> traceMethod(targetMethod, extractionContext));
-        }
     }
 
     private static void captureConstantsFromMethod(MethodDeclaration method, ExtractionContext extractionContext) {
@@ -221,7 +220,6 @@ public class JavaParser {
             } catch (Exception ignored) {
             }
         });
-
         method.findAll(NameExpr.class).forEach(ne -> {
             try {
                 checkAndRecordConstant(ne.resolve().asField(), extractionContext);
@@ -231,36 +229,40 @@ public class JavaParser {
     }
 
     private static void checkAndRecordConstant(ResolvedFieldDeclaration resolvedField, ExtractionContext extractionContext) {
-        if (resolvedField.isStatic()) {
-            String declaringClassName = resolvedField.declaringType().getQualifiedName();
-            if (isApplicationClass(declaringClassName)) {
-                findClassDeclarationByQualifiedName(declaringClassName).ifPresent(decl -> {
-                    for (FieldDeclaration fieldDecl : decl.getFields()) {
-                        if (fieldDecl.hasModifier(com.github.javaparser.ast.Modifier.Keyword.FINAL)) {
-                            for (VariableDeclarator var : fieldDecl.getVariables()) {
-                                if (var.getNameAsString().equals(resolvedField.getName())) {
-                                    extractionContext.capturedConstants
-                                            .computeIfAbsent(declaringClassName, k -> new LinkedHashSet<>())
-                                            .add(fieldDecl.toString());
-                                }
-                            }
-                        }
-                    }
-                });
+        if (!resolvedField.isStatic()) {
+            return;
+        }
+        String declaringClassName = resolvedField.declaringType().getQualifiedName();
+        if (!isApplicationClass(declaringClassName)) {
+            return;
+        }
+        findClassDeclarationByQualifiedName(declaringClassName)
+                .flatMap(decl -> findMatchingFinalFieldSnippet(decl, resolvedField.getName()))
+                .ifPresent(fieldSnippet ->
+                        extractionContext.capturedConstants
+                                .computeIfAbsent(declaringClassName, k -> new LinkedHashSet<>())
+                                .add(fieldSnippet)
+                );
+    }
+
+    private static Optional<String> findMatchingFinalFieldSnippet(ClassOrInterfaceDeclaration decl, String fieldName) {
+        for (FieldDeclaration fieldDecl : decl.getFields()) {
+            if (fieldDecl.isFinal()) {
+                boolean matchesName = fieldDecl.getVariables().stream()
+                        .anyMatch(var -> var.getNameAsString().equals(fieldName));
+                if (matchesName) {
+                    return Optional.of(fieldDecl.toString());
+                }
             }
         }
+        return Optional.empty();
     }
 
     private static void captureDataTypes(Set<ClassOrInterfaceDeclaration> capturedDataTypes, MethodDeclaration method) {
-        // 1. Return type (unwraps List<T>, Optional<T>, etc.)
         addTypeIfEntityOrDto(method.getType(), capturedDataTypes);
-
-        // 2. Parameters
         for (Parameter param : method.getParameters()) {
             addTypeIfEntityOrDto(param.getType(), capturedDataTypes);
         }
-
-        // 3. (Optional) Inspect local variable declarations inside the method body
         method.findAll(VariableDeclarator.class).forEach(var -> {
             addTypeIfEntityOrDto(var.getType(), capturedDataTypes);
         });
@@ -271,23 +273,19 @@ public class JavaParser {
                 decl.getNameAsString().endsWith("Service") || decl.getNameAsString().endsWith("Controller")) {
             return false;
         }
-
         String pkg = decl.getFullyQualifiedName().orElse("").toLowerCase();
         boolean matchesPackagePattern = pkg.contains(".entity.") || pkg.contains(".dto.") ||
-                pkg.contains(".model.") || pkg.contains(".domain.");
-
+                pkg.contains(".model.") || pkg.contains(".data.");
         boolean hasDataAnnotation = decl.getAnnotations().stream().anyMatch(a -> {
             String name = a.getNameAsString();
             return name.equals("Entity") || name.equals("Table") || name.equals("Data") || name.equals("Value");
         });
-
         return matchesPackagePattern || hasDataAnnotation;
     }
 
     private static String extractProcedureContract(MethodCallExpr invocation, ResolvedMethodDeclaration target) {
         StringBuilder sb = new StringBuilder();
         String className = target.declaringType().getName();
-
         sb.append("// BLACK-BOX CALL: ").append(className).append("#").append(target.getName()).append("\n");
         if (!invocation.getArguments().isEmpty()) {
             sb.append("// Passed Arguments:\n");
@@ -307,15 +305,12 @@ public class JavaParser {
         for (CompilationUnit cu : allCompilationUnits) {
             for (ClassOrInterfaceDeclaration clazz : cu.findAll(ClassOrInterfaceDeclaration.class)) {
                 if (clazz.isInterface() || clazz.isAbstract()) continue;
-
                 boolean implementsInterface = clazz.getImplementedTypes().stream()
                         .map(ClassOrInterfaceType::getNameAsString)
                         .anyMatch(targetInterfaceQualifiedName::endsWith);
-
                 boolean extendsSuperclass = clazz.getExtendedTypes().stream()
                         .map(ClassOrInterfaceType::getNameAsString)
                         .anyMatch(targetInterfaceQualifiedName::endsWith);
-
                 if (implementsInterface || extendsSuperclass) {
                     implementations.add(clazz);
                 }
@@ -352,7 +347,7 @@ public class JavaParser {
                     })
                     .forEach(p -> sourceRoots.add(p.toFile()));
         } catch (Exception e) {
-            System.err.println("Warning: Failed to walk project paths.");
+            System.err.print("Warning: Failed to walk project paths.");
         }
         if (sourceRoots.isEmpty()) {
             sourceRoots.add(new File(rootPath));
@@ -371,149 +366,6 @@ public class JavaParser {
         return payload;
     }
 
-    private static void appendEntryPoint(StringBuilder payload, ClassOrInterfaceDeclaration targetClass, MethodDeclaration targetMethod) {
-        payload.append("// ENTRY POINT: ")
-                .append(targetClass.getFullyQualifiedName().orElse(targetClass.getNameAsString()))
-                .append("#").append(targetMethod.getNameAsString()).append("\n\n");
-    }
-
-    private static void appendExecutableMethods(StringBuilder payload, Set<MethodDeclaration> capturedMethods) {
-        payload.append("// --- TRACED EXECUTABLE METHODS ---\n\n");
-        for (MethodDeclaration method : capturedMethods) {
-            String className = method.findAncestor(ClassOrInterfaceDeclaration.class)
-                    .flatMap(ClassOrInterfaceDeclaration::getFullyQualifiedName)
-                    .orElse("Unknown");
-            payload.append("// Method: ").append(className).append("#").append(method.getNameAsString()).append("\n");
-            payload.append(method).append("\n\n-----------------------------------\n\n");
-        }
-    }
-
-    private static void appendCapturedInterfaces(
-            StringBuilder payload,
-            Set<ClassOrInterfaceDeclaration> capturedInterfaces,
-            Map<String, Set<String>> interfaceInvokedMethods) {
-
-        if (capturedInterfaces.isEmpty()) return;
-
-        payload.append("// --- APPLICATION INTERFACES & CONTRACTS (JPA/SERVICES) ---\n\n");
-
-        for (ClassOrInterfaceDeclaration iface : capturedInterfaces) {
-            String qName = iface.getFullyQualifiedName().orElse(iface.getNameAsString());
-            Set<String> invokedSignatures = interfaceInvokedMethods.getOrDefault(qName, Collections.emptySet());
-
-            // Extract just the method names invoked during tracing (e.g. "find", "findById")
-            Set<String> invokedMethodNames = new HashSet<>();
-            for (String sig : invokedSignatures) {
-                String methodName = sig.substring(sig.lastIndexOf('.') + 1).split("\\(")[0];
-                invokedMethodNames.add(methodName);
-            }
-
-            payload.append("// Interface: ").append(qName).append("\n");
-
-            // Print Class Level Annotations
-            iface.getAnnotations().forEach(a -> payload.append(a.toString()).append("\n"));
-
-            // Print Interface Shell
-            payload.append("public interface ").append(iface.getNameAsString());
-            if (!iface.getExtendedTypes().isEmpty()) {
-                payload.append(" extends ");
-                for (int i = 0; i < iface.getExtendedTypes().size(); i++) {
-                    payload.append(iface.getExtendedTypes().get(i).toString());
-                    if (i < iface.getExtendedTypes().size() - 1) payload.append(", ");
-                }
-            }
-            payload.append(" {\n");
-
-            // 1. Print ONLY declared methods that were actually invoked
-            boolean printedAny = false;
-            for (MethodDeclaration method : iface.getMethods()) {
-                if (invokedMethodNames.contains(method.getNameAsString())) {
-                    payload.append("    ").append(method.getDeclarationAsString()).append(";\n");
-                    printedAny = true;
-                }
-            }
-
-            // 2. Print inherited methods (like findById) that are NOT explicitly declared in .java file
-            for (String invokedSig : invokedSignatures) {
-                String methodName = invokedSig.substring(invokedSig.lastIndexOf('.') + 1).split("\\(")[0];
-                boolean isDeclaredInAst = iface.getMethods().stream()
-                        .anyMatch(m -> m.getNameAsString().equals(methodName));
-
-                if (!isDeclaredInAst) {
-                    String simpleSig = invokedSig.substring(invokedSig.lastIndexOf('.') + 1);
-                    payload.append("    // Inherited Execution Call: ").append(simpleSig).append(";\n");
-                    printedAny = true;
-                }
-            }
-
-            if (!printedAny) {
-                payload.append("    // (No methods from this interface were referenced in this execution trace)\n");
-            }
-
-            payload.append("}\n\n-----------------------------------\n\n");
-        }
-    }
-
-    private static void appendReferencedConstants(StringBuilder payload, Map<String, Set<String>> capturedConstants) {
-        if (!capturedConstants.isEmpty()) {
-            payload.append("// --- REFERENCED CONSTANTS ---\n\n");
-            for (Map.Entry<String, Set<String>> entry : capturedConstants.entrySet()) {
-                payload.append("// Declared In: ").append(entry.getKey()).append("\n");
-                for (String fieldSnippet : entry.getValue()) {
-                    payload.append("  ").append(fieldSnippet).append("\n");
-                }
-                payload.append("\n-----------------------------------\n\n");
-            }
-        }
-    }
-
-    private static void appendBlackboxCalls(StringBuilder payload, Set<String> blackBoxCalls) {
-        if (!blackBoxCalls.isEmpty()) {
-            payload.append("// --- BLACK-BOX DAO / STORED PROCEDURE CALLS ---\n\n");
-            for (String callSummary : blackBoxCalls) {
-                payload.append(callSummary).append("\n-----------------------------------\n\n");
-            }
-        }
-    }
-
-    private static ClassOrInterfaceDeclaration cleanDataModelForPayload(ClassOrInterfaceDeclaration originalDecl) {
-        ClassOrInterfaceDeclaration cleanDecl = originalDecl.clone();
-        cleanDecl.getConstructors().forEach(cleanDecl::remove);
-        cleanDecl.getMethods().forEach(method -> {
-            String name = method.getNameAsString();
-            boolean isGetter = (name.startsWith("get") || name.startsWith("is"))
-                    && method.getParameters().isEmpty()
-                    && !method.getType().isVoidType();
-
-            boolean isSetter = name.startsWith("set")
-                    && method.getParameters().size() == 1
-                    && method.getType().isVoidType();
-
-            if (isGetter || isSetter) {
-                cleanDecl.remove(method);
-            }
-        });
-        return cleanDecl;
-    }
-
-    private static void appendDependentDataTypes(StringBuilder payload, Set<ClassOrInterfaceDeclaration> capturedDataTypes, Set<MethodDeclaration> capturedMethods, ClassOrInterfaceDeclaration targetClass) {
-        if (!capturedDataTypes.isEmpty()) {
-            payload.append("// --- DEPENDENT DATA TYPES / ENTITIES ---\n\n");
-            for (ClassOrInterfaceDeclaration type : capturedDataTypes) {
-                boolean isAlreadyTracedService = capturedMethods.stream()
-                        .anyMatch(m -> m.findAncestor(ClassOrInterfaceDeclaration.class).map(type::equals).orElse(false));
-
-                if (!type.equals(targetClass) && !isAlreadyTracedService) {
-                    ClassOrInterfaceDeclaration cleanedType = cleanDataModelForPayload(type);
-                    payload.append("// Type Definition: ")
-                            .append(cleanedType.getFullyQualifiedName().orElse(cleanedType.getNameAsString()))
-                            .append("\n");
-                    payload.append(cleanedType.toString()).append("\n\n-----------------------------------\n\n");
-                }
-            }
-        }
-    }
-
     private static void addTypeIfEntityOrDto(Type type, Set<ClassOrInterfaceDeclaration> capturedDataTypes) {
         if (type == null) return;
         try {
@@ -525,10 +377,7 @@ public class JavaParser {
 
     private static void extractAndRegisterType(ResolvedType resolvedType, Set<ClassOrInterfaceDeclaration> capturedDataTypes) {
         if (!resolvedType.isReferenceType()) return;
-
         String qualifiedName = resolvedType.asReferenceType().getQualifiedName();
-
-        // 1. Direct check: Is this type itself an application entity/DTO?
         if (isApplicationClass(qualifiedName)) {
             findClassDeclarationByQualifiedName(qualifiedName).ifPresent(decl -> {
                 if (isDataModelType(decl)) {
@@ -536,13 +385,11 @@ public class JavaParser {
                 }
             });
         }
-
-        // 2. Unpack Generics: e.g. List<AnInternalObject>, Optional<MyDto>, Map<String, MyEntity>
         try {
             var typeParametersMap = resolvedType.asReferenceType().getTypeParametersMap();
             for (var pair : typeParametersMap) {
                 ResolvedType genericTypeParam = pair.b;
-                extractAndRegisterType(genericTypeParam, capturedDataTypes); // Recursively check generic arguments
+                extractAndRegisterType(genericTypeParam, capturedDataTypes);
             }
         } catch (Exception ignored) {
         }
